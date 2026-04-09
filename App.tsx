@@ -1,7 +1,7 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { ExternalLink, AlertTriangle, ListChecks, X, Zap, Activity, ChevronDown, ChevronUp, Crosshair, TrendingUp, Shield, ArrowRight, Maximize, Minimize, Bell, BellRing, Trash2, Gauge } from 'lucide-react';
-import { executeKaliCommand, getTacticalAdvice } from './services/geminiService';
+import { executeKaliCommand, getTacticalAdvice } from './services/tacticalService';
 import { KaliCommandResult, AnalysisStep, CommandAlert } from './types';
 import PredictionMeter from './components/PredictionMeter';
 import StockChart from './components/StockChart';
@@ -29,6 +29,13 @@ const App: React.FC = () => {
   const [chatInput, setChatInput] = useState('');
   const [isChatLoading, setIsChatLoading] = useState(false);
   const [lastAdvice, setLastAdvice] = useState<string | null>(null);
+  const [ollamaModels, setOllamaModels] = useState<any[]>([]);
+  const [selectedModelL, setSelectedModelL] = useState<string>('');
+  const [selectedModelR, setSelectedModelR] = useState<string>('');
+  const [selectedModel, setSelectedModel] = useState<string>('');
+  const [ollamaStatus, setOllamaStatus] = useState<string>('INITIALIZING');
+  const [isPulling, setIsPulling] = useState(false);
+  const [tacticalMode, setTacticalMode] = useState<'analyze' | 'Collab' | 'debate'>('analyze');
   
   // Recent Commands System
   const [favorites, setFavorites] = useState<string[]>(['nmap -sV target', 'sqlmap -u url', 'metasploit', 'hydra -l admin', 'wireshark', 'aircrack-ng', 'john the ripper', 'burp suite', 'nikto -h target', 'gobuster dir', 'enum4linux', 'searchsploit']);
@@ -74,6 +81,73 @@ const App: React.FC = () => {
     return () => clearInterval(interval);
   }, [alerts, result]);
 
+  // Fetch Ollama Models and Status
+  useEffect(() => {
+    const fetchModels = async () => {
+      try {
+        const res = await fetch('/api/models');
+        if (res.ok) {
+          const models = await res.json();
+          setOllamaModels(models);
+          if (models.length > 0) {
+            if (!selectedModelL) setSelectedModelL(models[0].name);
+            if (!selectedModelR) setSelectedModelR(models[0].name);
+            if (!selectedModel) setSelectedModel(models[0].name);
+          }
+        }
+      } catch (err) {
+        console.error("Failed to fetch Ollama models:", err);
+      }
+    };
+
+    const fetchStatus = async () => {
+      try {
+        const res = await fetch('/api/status');
+        if (res.ok) {
+          const data = await res.json();
+          setOllamaStatus(data.status);
+        }
+      } catch (err) {
+        setOllamaStatus('OFFLINE');
+      }
+    };
+
+    fetchModels();
+    fetchStatus();
+
+    const statusInterval = setInterval(() => {
+      fetchStatus();
+      if (ollamaStatus === 'ONLINE' || ollamaStatus === 'OFFLINE') {
+        fetchModels();
+      }
+    }, 3000);
+
+    return () => clearInterval(statusInterval);
+  }, [selectedModel, ollamaStatus]);
+
+  const handlePullModel = async () => {
+    const modelToPull = prompt("Enter model name to pull (e.g., llama3):", "llama3");
+    if (!modelToPull) return;
+
+    setIsPulling(true);
+    try {
+      const res = await fetch('/api/pull', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: modelToPull })
+      });
+      if (res.ok) {
+        alert(`Successfully pulled ${modelToPull}`);
+      } else {
+        alert(`Failed to pull ${modelToPull}`);
+      }
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setIsPulling(false);
+    }
+  };
+
   // Update currentPage when symbol changes to a favorite on a different page
   useEffect(() => {
     const idx = favorites.indexOf(symbol);
@@ -97,8 +171,10 @@ const App: React.FC = () => {
     }
   }, [step, result, error, strategyExpanded]);
 
-  const handleSearch = async () => {
-    const commandsToRun = isMultiSelectMode && selectedCommands.length > 0 ? selectedCommands.join(' && ') : symbol;
+  const handleSearch = async (overrideCmd?: string, overrideModel?: string) => {
+    const commandsToRun = overrideCmd || (isMultiSelectMode && selectedCommands.length > 0 ? selectedCommands.join(' && ') : symbol);
+    const activeModel = overrideModel || selectedModel;
+
     if (!commandsToRun.trim() || step === AnalysisStep.INJECTING_PAYLOAD || step === AnalysisStep.BRUTEFORCING || step === AnalysisStep.ESCALATING_PRIVILEGES) return;
 
     setError(null);
@@ -109,7 +185,7 @@ const App: React.FC = () => {
     setTimeRemaining(12); // Estimated 12 seconds total
 
     try {
-      const analysisPromise = executeKaliCommand(commandsToRun);
+      const analysisPromise = executeKaliCommand(commandsToRun, activeModel);
 
       const totalSteps = 3;
       const stepDuration = 4000; // 4 seconds per step
@@ -163,17 +239,32 @@ const App: React.FC = () => {
     
     setIsChatLoading(true);
     try {
-      const advice = await getTacticalAdvice(chatInput);
-      setLastAdvice(advice);
-      setChatInput('');
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: selectedModel,
+          messages: [{ role: 'user', content: chatInput }]
+        })
+      });
+      
+      if (res.ok) {
+        const data = await res.json();
+        setLastAdvice(data.message.content);
+        setChatInput('');
+      } else {
+        const errData = await res.json();
+        setLastAdvice(`ERROR: ${errData.error || 'COMMUNICATION_FAILURE'}`);
+      }
     } catch (err) {
       console.error(err);
+      setLastAdvice("CRITICAL_ERROR: OLLAMA_BRIDGE_OFFLINE");
     } finally {
       setIsChatLoading(false);
     }
   };
 
-  const handlePadClick = (preset: string) => {
+  const handlePadClick = (preset: string, model?: string) => {
     let finalCmd = preset;
     
     // If we have a symbol that looks like a target (no spaces, not a known command)
@@ -198,6 +289,10 @@ const App: React.FC = () => {
       );
     } else {
       setSymbol(finalCmd);
+      if (model) {
+        setSelectedModel(model);
+        handleSearch(finalCmd, model);
+      }
     }
   };
 
@@ -243,6 +338,13 @@ const App: React.FC = () => {
     setStrategyExpanded(false);
     setSelectedCommands([]);
     setIsMultiSelectMode(false);
+  };
+
+  const saveToFavorites = () => {
+    if (symbol.trim() && !favorites.includes(symbol.trim())) {
+      setFavorites(prev => [symbol.trim(), ...prev]);
+      alertUser(symbol.trim(), 0, "SAVED_TO_FAV_STORE");
+    }
   };
 
   // Fader Logic for Pages
@@ -333,7 +435,7 @@ const App: React.FC = () => {
                   {/* Command Input Display - Always visible */}
                   <div className="mb-6">
                     <div className="flex justify-between items-end mb-1">
-                      <div className="text-sm opacity-60 uppercase tracking-tighter">TARGET:</div>
+                      <div className="text-sm opacity-60 uppercase tracking-tighter">USER INPUT:</div>
                       {step !== AnalysisStep.IDLE && step !== AnalysisStep.COMPLETE && step !== AnalysisStep.ERROR && (
                         <div className="flex items-center gap-3 text-sm font-bold animate-pulse">
                           <div className="flex items-center gap-2">
@@ -356,7 +458,7 @@ const App: React.FC = () => {
                       value={isMultiSelectMode ? selectedCommands.join(' && ') : symbol}
                       onChange={(e) => !isMultiSelectMode && setSymbol(e.target.value)}
                       onKeyDown={handleKeyDown}
-                      placeholder="ENTER_TARGET_OR_CMD..."
+                      placeholder="ENTER_USER_INPUT..."
                       className="w-full bg-black border-2 border-[#2d1a0e] text-3xl md:text-4xl font-bold text-[#e08031] placeholder-[#e08031]/30 px-4 py-2 focus:outline-none font-['VT323'] shadow-[inset_0_2px_5px_rgba(0,0,0,0.5)] rounded-sm tracking-wider"
                       readOnly={isMultiSelectMode || (step !== AnalysisStep.IDLE && step !== AnalysisStep.ERROR && step !== AnalysisStep.COMPLETE)}
                     />
@@ -398,19 +500,24 @@ const App: React.FC = () => {
                     )}
                   </div>
 
-                  {/* AI Tactical Input Bar - Relocated to bottom per arrow */}
-                  <div className="mt-auto border-2 border-[#2d1a0e] bg-black shadow-[inset_0_2px_5px_rgba(0,0,0,0.5)] rounded-sm overflow-hidden flex items-center px-4 py-2 gap-3">
-                    <Zap size={24} className={`${isChatLoading ? 'text-[#e08031] animate-pulse' : 'text-[#e08031]'}`} />
-                    <input 
-                      type="text"
-                      value={chatInput}
-                      onChange={(e) => setChatInput(e.target.value)}
-                      onKeyDown={(e) => e.key === 'Enter' && handleChatSubmit()}
-                      placeholder={isChatLoading ? "ANALYZING..." : "ENTER TACTICAL QUERY OR CMD"}
-                      className="bg-transparent border-none outline-none text-3xl md:text-4xl w-full placeholder-[#e08031]/30 font-bold uppercase tracking-wider text-[#e08031] font-['VT323']"
-                      disabled={isChatLoading}
-                    />
-                    {isChatLoading && <div className="w-4 h-4 rounded-full bg-[#e08031] animate-ping mr-2"></div>}
+                  {/* Ollama Status Indicator */}
+                  <div className="mt-4 flex items-center gap-2">
+                    <div className={`w-2 h-2 rounded-full ${
+                      ollamaStatus.startsWith('ONLINE') ? 'bg-green-500 shadow-[0_0_5px_rgba(34,197,94,0.8)]' : 
+                      ollamaStatus === 'PULLING_MODEL' || ollamaStatus === 'INITIALIZING' ? 'bg-blue-500 animate-pulse shadow-[0_0_5px_rgba(59,130,246,0.8)]' :
+                      'bg-red-500 shadow-[0_0_5px_rgba(239,68,68,0.8)]'
+                    }`}></div>
+                    <span className="text-[10px] font-bold tracking-widest opacity-60 uppercase">OLLAMA_BRIDGE: {ollamaStatus}</span>
+                    
+                    <div className="ml-auto flex items-center gap-2">
+                      <button 
+                        onClick={handlePullModel}
+                        disabled={isPulling || ollamaStatus === 'PULLING_MODEL'}
+                        className="bg-[#e08031]/10 border border-[#e08031]/30 text-[#e08031] text-[10px] font-bold px-2 py-1 hover:bg-[#e08031]/20 transition-colors disabled:opacity-50"
+                      >
+                        {isPulling || ollamaStatus === 'PULLING_MODEL' ? 'PULLING...' : 'PULL_NEW'}
+                      </button>
+                    </div>
                   </div>
 
                   {/* Tactical Advice Display - Integrated into terminal flow */}
@@ -693,6 +800,32 @@ const App: React.FC = () => {
                       )}
                     </div>
                   )}
+                  {/* Tactical Chat Input - Moved into Screen */}
+                  <div className="mt-auto pt-6 border-t-2 border-[#2d1a0e]/20">
+                    <div className="text-sm opacity-60 uppercase tracking-tighter mb-1 font-bold">TACTICAL_QUERY:</div>
+                    <div className="w-full border-2 border-[#2d1a0e] bg-black shadow-[inset_0_2px_5px_rgba(0,0,0,0.5)] rounded-sm overflow-hidden flex items-center px-4 py-2 gap-3 group focus-within:border-[#2d1a0e] transition-colors">
+                      <Zap size={20} className={`${isChatLoading ? 'text-[#e08031] animate-pulse' : 'text-[#2d1a0e]/40 group-focus-within:text-[#e08031]'} transition-colors`} />
+                      <input 
+                        type="text"
+                        value={chatInput}
+                        onChange={(e) => setChatInput(e.target.value)}
+                        onKeyDown={(e) => e.key === 'Enter' && handleChatSubmit()}
+                        placeholder={isChatLoading ? "ANALYZING..." : "ENTER_TACTICAL_QUERY..."}
+                        className="bg-transparent border-none outline-none text-2xl w-full placeholder-[#e08031]/20 font-bold uppercase tracking-wider text-[#e08031] font-['VT323']"
+                        disabled={isChatLoading}
+                      />
+                      {isChatLoading ? (
+                        <div className="w-4 h-4 rounded-full bg-[#e08031] animate-ping"></div>
+                      ) : (
+                        <button 
+                          onClick={handleChatSubmit}
+                          className="text-xs font-bold bg-[#2d1a0e] text-[#e08031] px-3 py-1 rounded-sm hover:bg-[#2d1a0e]/80 active:translate-y-0.5 transition-all uppercase"
+                        >
+                          SEND
+                        </button>
+                      )}
+                    </div>
+                  </div>
                   <div ref={screenEndRef} />
                 </div>
               </div>
@@ -711,127 +844,171 @@ const App: React.FC = () => {
 
         {/* --- BOTTOM: CONTROL DECK - HIDDEN IN FULLSCREEN --- */}
         {!isFullscreen && (
-          <div className="p-8 bg-[#282b30] grid grid-cols-1 md:grid-cols-12 gap-8 relative">
+          <div className="p-8 bg-[#282b30] flex flex-col gap-8 relative">
             
-               {/* Left Zone: Fader & Pads */}
-            <div className="md:col-span-5 flex gap-4">
-               {/* Fader Section - Page Scroll */}
-               <div className="flex flex-col items-center justify-center gap-2">
-                  <div className="flex items-center gap-2">
-                    <div className="h-32 w-8 bg-[#1a1c20] rounded-full relative shadow-[inset_0_2px_4px_rgba(0,0,0,0.8)] flex justify-center py-2">
-                       <div className="w-1 h-full bg-[#333]"></div>
-                       
-                       {/* Invisible Range Input for Interaction */}
-                       <input 
-                        type="range" 
-                        min="0" 
-                        max={Math.max(0, totalPages - 1)} 
-                        value={currentPage}
-                        onChange={handleFaderChange}
-                        className="absolute inset-0 w-full h-full opacity-0 cursor-ns-resize z-10"
-                        style={{ appearance: 'slider-vertical' } as unknown as React.CSSProperties} 
-                       />
+            <div className="grid grid-cols-1 md:grid-cols-12 gap-8">
+               {/* Left Zone: Tactical Pads & Mode Dial */}
+               <div className="md:col-span-5 flex items-center justify-between gap-4">
+                  {/* Left Pad Unit */}
+                  <div className="flex flex-col items-center gap-2">
+                    {/* Model Select Window (Orange Screen Style) */}
+                    <div className="w-20 h-8 screen-texture border-2 border-[#2d1a0e]/40 rounded-sm flex items-center justify-center relative shadow-inner">
+                      <select 
+                        value={selectedModelL}
+                        onChange={(e) => {
+                          setSelectedModelL(e.target.value);
+                          setSelectedModel(e.target.value);
+                        }}
+                        className="bg-transparent border-none outline-none w-full h-full text-[10px] font-['VT323'] text-[#2d1a0e] font-black text-center appearance-none cursor-pointer px-1"
+                      >
+                        {ollamaModels.length > 0 ? (
+                          ollamaModels.map((m) => (
+                            <option key={m.name} value={m.name} className="bg-[#e08031] text-[#2d1a0e]">{m.name.toUpperCase()}</option>
+                          ))
+                        ) : (
+                          <option value="">OFFLINE</option>
+                        )}
+                      </select>
+                      <div className="absolute right-1 top-1/2 -translate-y-1/2 pointer-events-none">
+                        <ChevronDown size={8} className="text-[#2d1a0e]" />
+                      </div>
+                    </div>
+                    
+                    {/* Left Blue Pad (25% size) */}
+                    <button 
+                      onClick={() => handlePadClick("SCAN_NETWORK", selectedModelL)}
+                      className="w-16 h-16 bg-blue-600 hover:bg-blue-500 border-2 border-blue-400 rounded-md shadow-[0_4px_0_#1e40af] active:shadow-none active:translate-y-1 transition-all flex flex-col items-center justify-center gap-1 text-white font-black text-[10px] tracking-tighter uppercase"
+                    >
+                      <Activity size={16} />
+                      PAD_L
+                    </button>
+                  </div>
 
-                       {/* Visual Fader Handle */}
-                       <div 
-                          className="absolute w-6 h-10 bg-gradient-to-b from-[#4a4f55] to-[#2c3035] rounded-sm shadow-lg border border-[#555] pointer-events-none transition-all duration-100"
-                          style={{ bottom: `${faderPosition}%` }}
-                       ></div>
+                  {/* Tactical Mode Dial */}
+                  <div className="flex flex-col items-center gap-2">
+                    <div className="flex justify-between w-32 px-1 text-[8px] font-bold text-gray-500 tracking-tighter uppercase">
+                      <span className={tacticalMode === 'analyze' ? 'text-blue-400' : ''}>ANALYZE</span>
+                      <span className={tacticalMode === 'Collab' ? 'text-blue-400' : ''}>COLLAB</span>
+                      <span className={tacticalMode === 'debate' ? 'text-blue-400' : ''}>DEBATE</span>
+                    </div>
+                    
+                    <div className="relative w-24 h-24 flex items-center justify-center">
+                      {/* Perimeter Lines (Tick Marks) */}
+                      <div className="absolute inset-0 pointer-events-none">
+                        {[...Array(12)].map((_, i) => (
+                          <div 
+                            key={i}
+                            className="absolute top-0 left-1/2 -translate-x-1/2 w-0.5 h-2 bg-gray-600/40 origin-[center_48px]"
+                            style={{ transform: `translateX(-50%) rotate(${i * 30}deg)` }}
+                          ></div>
+                        ))}
+                      </div>
+
+                      {/* The Knob Body */}
+                      <button 
+                        onClick={() => {
+                          const modes: ('analyze' | 'Collab' | 'debate')[] = ['analyze', 'Collab', 'debate'];
+                          const nextIndex = (modes.indexOf(tacticalMode) + 1) % modes.length;
+                          setTacticalMode(modes[nextIndex]);
+                        }}
+                        className="w-20 h-20 rounded-full bg-[#e0e0e0] knob-shadow relative transform transition-transform active:scale-95 flex items-center justify-center"
+                      >
+                        {/* Dial Pointer (Pill style like RESET) */}
+                        <div 
+                          className="absolute top-2 left-1/2 -translate-x-1/2 w-1.5 h-6 bg-[#333] rounded-full transition-transform duration-300 origin-[center_32px]"
+                          style={{ 
+                            transform: `translateX(-50%) rotate(${tacticalMode === 'analyze' ? -45 : tacticalMode === 'Collab' ? 0 : 45}deg)` 
+                          }}
+                        ></div>
+                        
+                        {/* Center Cap Detail */}
+                        <div className="w-4 h-4 rounded-full bg-[#ccc] border border-[#bbb] shadow-inner"></div>
+                      </button>
+                    </div>
+                    <span className="text-[10px] text-gray-400 font-bold tracking-widest uppercase">MODE_DIAL</span>
+                  </div>
+
+                  {/* Right Pad Unit */}
+                  <div className="flex flex-col items-center gap-2">
+                    {/* Model Select Window (Orange Screen Style) */}
+                    <div className="w-20 h-8 screen-texture border-2 border-[#2d1a0e]/40 rounded-sm flex items-center justify-center relative shadow-inner">
+                      <select 
+                        value={selectedModelR}
+                        onChange={(e) => {
+                          setSelectedModelR(e.target.value);
+                          setSelectedModel(e.target.value);
+                        }}
+                        className="bg-transparent border-none outline-none w-full h-full text-[10px] font-['VT323'] text-[#2d1a0e] font-black text-center appearance-none cursor-pointer px-1"
+                      >
+                        {ollamaModels.length > 0 ? (
+                          ollamaModels.map((m) => (
+                            <option key={m.name} value={m.name} className="bg-[#e08031] text-[#2d1a0e]">{m.name.toUpperCase()}</option>
+                          ))
+                        ) : (
+                          <option value="">OFFLINE</option>
+                        )}
+                      </select>
+                      <div className="absolute right-1 top-1/2 -translate-y-1/2 pointer-events-none">
+                        <ChevronDown size={8} className="text-[#2d1a0e]" />
+                      </div>
                     </div>
 
-                    {/* Page Indicator Squares */}
-                    <div className="flex flex-col gap-2">
-                       {[...Array(totalPages)].map((_, i) => (
-                         <div key={i} className="w-3 h-3 bg-[#111] border border-[#333] flex items-center justify-center rounded-sm">
-                            {i === currentPage && <div className="w-1.5 h-1.5 bg-green-500 rounded-full shadow-[0_0_5px_#22c55e]"></div>}
-                         </div>
-                       ))}
-                    </div>
-                  </div>
-                  <span className="text-[10px] text-gray-400 font-bold tracking-wider text-center leading-tight">PAGE<br/>SCROLL</span>
-               </div>
-
-               {/* Pads Section - Favorites (Paginated) */}
-               <div className="flex-1 flex flex-col gap-3">
-                  {/* Utility Buttons Row */}
-                  <div className="flex gap-2 mb-1">
-                     {/* Multi-Select Button */}
-                     <button 
-                        onClick={toggleMultiSelectMode}
-                        className={`group relative h-7 px-4 rounded-full shadow-[0_2px_0_rgba(0,0,0,0.5)] active:shadow-none active:translate-y-0.5 transition-all flex items-center justify-center border-2 ${isMultiSelectMode ? 'bg-[#3d261b] border-[#e08031]' : 'bg-[#ea5827] border-[#9e3310]'}`}
-                        title={isMultiSelectMode ? "Exit Multi-Select" : "Enter Multi-Select"}
-                     >
-                        <div className={`absolute top-1 right-2 w-1 h-1 rounded-full transition-all duration-300 ${isMultiSelectMode ? 'bg-[#e08031] shadow-[0_0_5px_#e08031]' : 'bg-[#333]'}`}></div>
-                        <ListChecks 
-                           size={14} 
-                           className={`${isMultiSelectMode ? 'text-[#e08031] drop-shadow-[0_0_8px_rgba(224,128,49,0.5)]' : 'text-[#521c0b] group-hover:text-black'}`} 
-                        />
-                        <span className={`ml-2 text-[9px] font-bold uppercase tracking-tighter ${isMultiSelectMode ? 'text-[#e08031]' : 'text-[#521c0b]'}`}>MULTI_SEL</span>
-                     </button>
-
-                     {/* Clear Input Button */}
-                     <button 
-                        onClick={() => setSymbol('')}
-                        className="h-7 px-4 bg-[#ea5827] hover:bg-[#ff6b3d] rounded-full shadow-[0_2px_0_rgba(0,0,0,0.5)] active:shadow-none active:translate-y-0.5 transition-all flex items-center justify-center border-2 border-[#9e3310] text-[#521c0b] font-bold"
-                        title="Clear Input"
-                     >
-                        <X size={14} />
-                        <span className="ml-2 text-[9px] uppercase tracking-tighter">CLEAR_IN</span>
-                     </button>
-                  </div>
-
-                  {/* Pads Grid */}
-                  <div className="grid grid-cols-3 gap-3 flex-1">
-                     {[0, 1, 2, 3, 4, 5].map((i) => {
-                        const favIndex = currentPage * pageSize + i;
-                        const fav = favorites[favIndex];
-                        const isSelected = fav && symbol === fav;
-                        return (
-                        <button 
-                           key={i}
-                           onClick={() => fav && handlePadClick(fav)}
-                           disabled={!fav}
-                           className={`pad-btn aspect-square bg-[#25282c] rounded-md shadow-[inset_0_-2px_4px_rgba(255,255,255,0.05),0_4px_6px_rgba(0,0,0,0.4)] border-t border-[#3a3f45] flex flex-col items-center justify-center relative group ${!fav ? 'opacity-30 cursor-default' : ''} ${isSelected ? 'bg-[#2f343a]' : ''}`}
-                        >
-                           <div className="absolute top-1.5 left-2 text-[9px] text-gray-600 font-bold tracking-widest">SLOT_{String.fromCharCode(65 + i)}</div>
-                           
-                           <span className={`text-gray-400 font-bold font-mono text-xs ${fav ? 'group-hover:text-orange-400' : ''} transition-colors truncate max-w-[90%] mt-2`}>
-                              {fav || '---'}
-                           </span>
-                           
-                           {/* LED Indicator */}
-                           <div className={`absolute bottom-2 w-1.5 h-1.5 rounded-full transition-all duration-300 ${isSelected ? 'bg-orange-500 shadow-[0_0_8px_orange]' : 'bg-[#111] border border-[#333]'}`}></div>
-                        </button>
-                        );
-                     })}
+                    {/* Right Blue Pad (25% size) */}
+                    <button 
+                      onClick={() => handlePadClick("EXPLOIT_TARGET", selectedModelR)}
+                      className="w-16 h-16 bg-blue-600 hover:bg-blue-500 border-2 border-blue-400 rounded-md shadow-[0_4px_0_#1e40af] active:shadow-none active:translate-y-1 transition-all flex flex-col items-center justify-center gap-1 text-white font-black text-[10px] tracking-tighter uppercase"
+                    >
+                      <Zap size={16} />
+                      PAD_R
+                    </button>
                   </div>
                </div>
-            </div>
 
             {/* Right Zone: Knobs & Main Buttons */}
             <div className="md:col-span-7 flex items-end justify-end gap-6 pl-6 border-l border-[#333]">
                
                {/* Knobs Group */}
                <div className="flex gap-4 mb-2">
+                  {/* Models Knob (Green) */}
+                  <div className="flex flex-col items-center gap-2">
+                     <div className="text-[10px] text-gray-400 font-bold">MODELS</div>
+                     <button 
+                       onClick={() => handlePullModel()} 
+                       className="w-14 h-14 rounded-full bg-[#4ade80] knob-shadow relative transform transition-transform active:scale-95 border-2 border-green-600/30"
+                     >
+                        <div className="absolute top-2 left-1/2 -translate-x-1/2 w-1 h-4 bg-[#1a2e1a] rounded-full"></div>
+                     </button>
+                  </div>
+
+                  {/* Save Knob (Yellow) */}
+                  <div className="flex flex-col items-center gap-2">
+                     <div className="text-[10px] text-gray-400 font-bold">SAVE</div>
+                     <button 
+                       onClick={saveToFavorites} 
+                       className="w-14 h-14 rounded-full bg-[#facc15] knob-shadow relative transform transition-transform active:scale-95 border-2 border-yellow-600/30"
+                     >
+                        <div className="absolute top-2 left-1/2 -translate-x-1/2 w-1 h-4 bg-[#2e2a1a] rounded-full"></div>
+                     </button>
+                  </div>
+
+                  {/* Reset Knob (White) */}
                   <div className="flex flex-col items-center gap-2">
                      <div className="text-[10px] text-gray-400 font-bold">RESET</div>
                      <button onClick={resetSystem} className="w-14 h-14 rounded-full bg-[#e0e0e0] knob-shadow relative transform transition-transform active:scale-95">
                         <div className="absolute top-2 left-1/2 -translate-x-1/2 w-1 h-4 bg-[#333] rounded-full"></div>
                      </button>
                   </div>
-                  <div className="flex flex-col items-center gap-2">
-                     <div className="text-[10px] text-gray-400 font-bold">VOL</div>
-                     <div className="w-14 h-14 rounded-full bg-[#1a1c20] knob-shadow relative border border-[#333]">
-                        <div className="absolute top-1 left-1/2 -translate-x-1/2 w-1 h-3 bg-white"></div>
-                     </div>
-                  </div>
                </div>
 
                {/* Rectangular Buttons - Updated Layout */}
                <div className="flex flex-col gap-2 min-w-[160px]">
+                  {/* Active Agent Display */}
+                  <div className="text-[9px] text-gray-500 font-bold tracking-widest uppercase text-right px-1">
+                    ACTIVE_AGENT: <span className="text-orange-500">{selectedModel || 'NONE'}</span>
+                  </div>
                   {/* Analyze Button - Full Width */}
                   <button 
-                    onClick={handleSearch}
+                    onClick={() => handleSearch()}
                     className={`h-14 ${step === AnalysisStep.INJECTING_PAYLOAD || step === AnalysisStep.BRUTEFORCING ? 'bg-orange-500/80 animate-pulse' : 'bg-[#ea5827] hover:bg-[#ff6b3d]'} rounded-md shadow-[0_4px_0_#9e3310] active:shadow-none active:translate-y-1 transition-all flex items-center justify-center text-sm font-bold text-[#521c0b] border-t border-[#ff8a63] tracking-wider uppercase`}
                   >
                     {step === AnalysisStep.IDLE || step === AnalysisStep.COMPLETE || step === AnalysisStep.ERROR ? 'EXECUTE' : 'RUNNING...'}
@@ -842,7 +1019,8 @@ const App: React.FC = () => {
                <div className="hidden md:block h-16 w-8 border-r-2 border-b-2 border-gray-600/30 rounded-br-xl mb-4"></div>
             </div>
           </div>
-        )}
+        </div>
+      )}
 
         {/* LEDs - HIDDEN IN FULLSCREEN */}
         {!isFullscreen && (
